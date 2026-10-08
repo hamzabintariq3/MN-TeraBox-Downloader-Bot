@@ -1374,3 +1374,37 @@ async def retry_command(
         f"🔄 Re-queued "
         f"<b>{result.modified_count}</b> failed jobs."
     )
+async def stop_queue_workers():
+    """
+    Gracefully stop all queue workers.
+    """
+
+    global _workers
+
+    if not _workers:
+        return
+
+    logger.info(
+        "Stopping %s TeraBox queue worker(s)...",
+        len(_workers),
+    )
+
+    for task in _workers:
+        if not task.done():
+            task.cancel()
+
+    for task in _workers:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(
+                "Error while stopping queue worker."
+            )
+
+    _workers.clear()
+
+    logger.info(
+        "All TeraBox queue workers stopped."
+    )
