@@ -242,69 +242,90 @@ def get_scraper_headers():
 
     return headers
 
-
 def get_file_info(share_url):
     headers = get_scraper_headers()
+    session = requests.Session()
+    session.headers.update(headers)
 
-    response = requests.get(
+    response = session.get(
         share_url,
-        headers=headers,
         allow_redirects=True,
         timeout=REQUEST_TIMEOUT,
     )
-
-    if response.status_code != 200:
-        raise ValueError(
-            f"Failed to fetch TeraBox page "
-            f"({response.status_code})"
-        )
+    response.raise_for_status()
 
     final_url = response.url
-
     parsed = urlparse(final_url)
-
-    surl = parse_qs(
-        parsed.query
-    ).get("surl", [None])[0]
+    surl = parse_qs(parsed.query).get("surl", [None])[0]
 
     if not surl:
-        raise ValueError(
-            "Invalid TeraBox URL: missing surl"
-        )
+        raise ValueError("Invalid TeraBox URL: missing surl")
 
-    page = requests.get(
+    page = session.get(
         final_url,
-        headers=headers,
         timeout=REQUEST_TIMEOUT,
     )
+    page.raise_for_status()
 
-    html = page.text
-
-    js_token = find_between(
-        html,
-        'fn%28%22',
-        '%22%29',
+    html = page.text or ""
+    normalized_html = (
+        html.replace(r"\"", '"')
+        .replace(r"\/", "/")
     )
 
-    logid = find_between(
-        html,
-        'dp-logid=',
-        '&',
+    js_token = ""
+    js_token_patterns = (
+        r'fn%28%22([^%]+)%22%29',
+        r"""fn\(["']([^"']+)["']\)""",
+        r"""["']?jsToken["']?\s*[:=]\s*["']([^"']+)["']""",
     )
 
-    bdstoken = find_between(
-        html,
-        'bdstoken":"',
-        '"',
+    for pattern in js_token_patterns:
+        match = re.search(pattern, normalized_html, re.IGNORECASE)
+        if match:
+            js_token = unquote(match.group(1))
+            break
+
+    logid = (
+        parse_qs(urlparse(final_url).query).get("dp-logid", [""])[0]
+        or parse_qs(urlparse(page.url).query).get("dp-logid", [""])[0]
     )
 
-    if not all([
-        js_token,
-        logid,
-        bdstoken,
-    ]):
+    if not logid:
+        match = re.search(
+            r"""dp-logid(?:=|%3D)([^&"'\\\s]+)""",
+            normalized_html,
+            re.IGNORECASE,
+        )
+        if match:
+            logid = unquote(match.group(1))
+
+    bdstoken = ""
+    bdstoken_patterns = (
+        r"""["']?bdstoken["']?\s*:\s*["']([^"']+)["']""",
+        r"""bdstoken\s*=\s*["']([^"']+)["']""",
+    )
+
+    for pattern in bdstoken_patterns:
+        match = re.search(pattern, normalized_html, re.IGNORECASE)
+        if match:
+            bdstoken = match.group(1)
+            break
+
+    missing = [
+        name
+        for name, value in (
+            ("jsToken", js_token),
+            ("dp-logid", logid),
+            ("bdstoken", bdstoken),
+        )
+        if not value
+    ]
+
+    if missing:
         raise ValueError(
-            "Failed to extract TeraBox authentication tokens"
+            "TeraBox page did not provide required token(s): "
+            + ", ".join(missing)
         )
 
     params = {
@@ -323,41 +344,36 @@ def get_file_info(share_url):
         "root": "1,",
     }
 
-    info = requests.get(
-        "https://www.terabox.app/share/list?"
-        + urlencode(params),
-        headers=headers,
+    info_response = session.get(
+        "https://www.terabox.app/share/list",
+        params=params,
         timeout=REQUEST_TIMEOUT,
-    ).json()
+    )
+    info_response.raise_for_status()
+    info = info_response.json()
 
     if info.get("errno") or not info.get("list"):
         raise ValueError(
-            f"TeraBox list API error: "
+            "TeraBox list API error: "
             f"{info.get('errmsg', 'Unknown error')}"
         )
 
     file_data = info["list"][0]
+    size_bytes = int(file_data.get("size") or 0)
+    download_link = file_data.get("dlink") or ""
 
-    size_bytes = int(
-        file_data.get("size", 0)
-    )
+    if not download_link:
+        raise ValueError("TeraBox response did not contain a download link")
 
     return {
-        "name": file_data.get(
-            "server_filename",
-            "download",
-        ),
-        "download_link": file_data.get(
-            "dlink",
-            "",
-        ),
+        "name": file_data.get("server_filename") or "download",
+        "download_link": download_link,
         "size_bytes": size_bytes,
         "size_str": get_size(size_bytes),
         "resolved_url": share_url,
         "original_url": share_url,
         "source": "scraper",
     }
-
 
 def get_download_info(url):
     if API_DOWNLOAD_REGEX.match(url):
