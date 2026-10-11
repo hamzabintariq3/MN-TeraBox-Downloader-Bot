@@ -314,20 +314,11 @@ def get_file_info(share_url):
             bdstoken = match.group(1)
             break
 
-    missing = [
-        name
-        for name, value in (
-            ("jsToken", js_token),
-            ("dp-logid", logid),
-            ("bdstoken", bdstoken),
-        )
-        if not value
-    ]
-
-    if missing:
+    # jsToken is required to call the share list endpoint. dp-logid can be
+    # absent on redirected share pages, and bdstoken is not used by this API.
+    if not js_token:
         raise ValueError(
-            "TeraBox page did not provide required token(s): "
-            + ", ".join(missing)
+            "TeraBox page did not provide the required jsToken"
         )
 
     params = {
@@ -721,7 +712,7 @@ def mark_retry(job_id, error):
 
     retry_count = int(job.get("retry_count", 0)) + 1
 
-    if retry_count > MAX_RETRIES:
+    if retry_count >= MAX_RETRIES:
         queue_col.update_one(
             {"job_id": job_id},
             {
@@ -1283,16 +1274,16 @@ async def cancel_command(
     job_id = parts[1].strip()
 
     result = await asyncio.to_thread(
-        lambda: queue_col.update_many(
+        lambda: queue_col.update_one(
             {
+                "job_id": job_id,
                 "user_id": message.from_user.id,
-                "status": "FAILED",
+                "status": {"$in": ["QUEUED", "RETRYING"]},
             },
             {
                 "$set": {
-                    "status": "QUEUED",
-                    "retry_count": 0,
-                    "error": None,
+                    "status": "CANCELLED",
+                    "error": "Cancelled by user",
                     "worker": None,
                 },
                 "$unset": {
@@ -1302,11 +1293,9 @@ async def cancel_command(
         )
     )
 
-
-
     if result.modified_count:
         await message.reply_text(
-            f"🛑 Job `{job_id}` cancelled."
+            f"🛑 Job <code>{escape(job_id)}</code> cancelled."
         )
     else:
         await message.reply_text(
