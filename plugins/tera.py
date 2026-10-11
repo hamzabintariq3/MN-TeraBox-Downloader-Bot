@@ -1122,7 +1122,6 @@ async def handle_terabox(
         disable_web_page_preview=True,
     )
 
-
 # ============================================================
 # /QUEUE
 # ============================================================
@@ -1135,34 +1134,28 @@ async def queue_command(
     client: Client,
     message: Message,
 ):
-
     rows = await asyncio.to_thread(
         lambda: list(
             queue_col.find(
                 {
-                    "user_id":
-                        message.from_user.id,
+                    "user_id": message.from_user.id,
                     "status": {
                         "$in": [
                             "QUEUED",
-        "DOWNLOADING",
-        "UPLOADING",
-        "RETRYING",
-    ],
-},
-
+                            "DOWNLOADING",
+                            "UPLOADING",
+                            "RETRYING",
+                        ],
+                    },
                 }
-            ).sort(
-                "created_at",
-                ASCENDING,
-            ).limit(20)
+            )
+            .sort("created_at", ASCENDING)
+            .limit(20)
         )
     )
 
     if not rows:
-        await message.reply_text(
-            "📭 Your queue is empty."
-        )
+        await message.reply_text("📭 Your queue is empty.")
         return
 
     lines = [
@@ -1170,30 +1163,12 @@ async def queue_command(
         "",
     ]
 
-    for index, job in enumerate(
-        rows,
-        1,
-    ):
+    for index, job in enumerate(rows, start=1):
+        name = job.get("filename") or "Resolving..."
+        status = job.get("status", "UNKNOWN")
+        lines.append(f"{index}. <b>{name}</b> — {status}")
 
-        name = (
-            job.get("filename")
-            or "Resolving..."
-        )
-
-        status = job.get(
-            "status",
-            "UNKNOWN",
-        )
-
-        lines.append(
-            f"{index}. <b>{name}</b> — "
-            f"{status}"
-        )
-
-    await message.reply_text(
-        "\n".join(lines)
-    )
-
+    await message.reply_text("\n".join(lines))
 
 # ============================================================
 # /STATUS
@@ -1349,7 +1324,6 @@ async def clear_command(
         f"<b>{result.modified_count}</b> queued jobs."
     )
 
-
 # ============================================================
 # /RETRY
 # ============================================================
@@ -1362,27 +1336,23 @@ async def retry_command(
     client: Client,
     message: Message,
 ):
-
     result = await asyncio.to_thread(
         lambda: queue_col.update_many(
             {
-                "user_id":
-                    message.from_user.id,
+                "user_id": message.from_user.id,
                 "status": "FAILED",
             },
-
-{
-    "$set": {
-        "status": "QUEUED",
-        "retry_count": 0,
-        "error": None,
-        "worker": None,
-    },
-    "$unset": {
-        "next_retry_at": "",
-    },
-}
-
+            {
+                "$set": {
+                    "status": "QUEUED",
+                    "retry_count": 0,
+                    "error": None,
+                    "worker": None,
+                },
+                "$unset": {
+                    "next_retry_at": "",
+                },
+            },
         )
     )
 
@@ -1390,6 +1360,7 @@ async def retry_command(
         f"🔄 Re-queued "
         f"<b>{result.modified_count}</b> failed jobs."
     )
+
 async def stop_queue_workers():
     """
     Gracefully stop all queue workers.
