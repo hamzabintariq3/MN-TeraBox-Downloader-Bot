@@ -465,6 +465,38 @@ def get_file_info(share_url):
         "source": "scraper",
     }
 
+
+def get_package_file_info(share_url):
+    """Use the installed TeraboxDL package as an alternate resolver."""
+    from TeraboxDL import TeraboxDL
+
+    cookie = TERABOX.COOKIE.strip()
+    if not cookie:
+        raise ValueError("TERABOX_COOKIE is empty")
+
+    result = TeraboxDL(cookie).get_file_info(share_url)
+    if not isinstance(result, dict):
+        raise ValueError("TeraboxDL returned an invalid response")
+
+    if result.get("error"):
+        raise ValueError(str(result["error"]))
+
+    download_link = result.get("download_link") or ""
+    if not download_link:
+        raise ValueError("TeraboxDL did not return a download link")
+
+    size_bytes = int(result.get("sizebytes") or 0)
+    return {
+        "name": result.get("file_name") or "download",
+        "download_link": download_link,
+        "size_bytes": size_bytes,
+        "size_str": result.get("file_size") or get_size(size_bytes),
+        "resolved_url": share_url,
+        "original_url": share_url,
+        "source": "terabox-downloader",
+    }
+
+
 def get_download_info(url):
     if API_DOWNLOAD_REGEX.match(url):
         return {
@@ -489,6 +521,16 @@ def get_download_info(url):
 
             if not TERABOX.API_FALLBACK_TO_SCRAPER:
                 raise
+
+            # The API can return a video-only fallback page for ordinary files.
+            # Try the installed TeraboxDL resolver before the legacy scraper.
+            try:
+                return get_package_file_info(url)
+            except Exception as package_error:
+                log.warning(
+                    "TeraboxDL resolver failed: %s",
+                    package_error,
+                )
 
     return get_file_info(url)
 
