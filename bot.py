@@ -87,7 +87,7 @@ class MN_Bot(Client):
         # -------------------------------------------------
 
         try:
-            from plugins.terabox import start_queue_workers
+            from plugins.tera import start_queue_workers
 
             await start_queue_workers(self)
 
