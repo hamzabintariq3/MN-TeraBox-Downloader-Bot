@@ -499,7 +499,7 @@ def create_job(
                     "DOWNLOADING",
                     "UPLOADING",
                     "RETRYING",
-                    "COMPLETED",
+                  
                 ]
             },
         },
@@ -1278,27 +1278,26 @@ async def cancel_command(
     job_id = parts[1].strip()
 
     result = await asyncio.to_thread(
-        lambda: queue_col.update_one(
+        lambda: queue_col.update_many(
             {
-                "job_id": job_id,
-                "user_id":
-                    message.from_user.id,
-                "status": {
-                    "$in": [
-                        "QUEUED",
-                        "RETRYING",
-                    ]
-                },
+                "user_id": message.from_user.id,
+                "status": "FAILED",
             },
             {
                 "$set": {
-                    "status": "CANCELLED",
-                    "error": "Cancelled by user",
+                    "status": "QUEUED",
+                    "retry_count": 0,
+                    "error": None,
                     "worker": None,
-                }
+                },
+                "$unset": {
+                    "next_retry_at": "",
+                },
             },
         )
     )
+
+
 
     if result.modified_count:
         await message.reply_text(
