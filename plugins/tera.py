@@ -223,6 +223,22 @@ def find_between(text, start, end):
         return ""
 
 
+def extract_page_value(page_html, key):
+    """Read a scalar field from TeraBox's embedded page data."""
+    escaped_key = re.escape(key)
+    patterns = (
+        rf'''["']{escaped_key}["']\s*:\s*["']([^"']+)["']''',
+        rf'''\b{escaped_key}\s*=\s*["']([^"']+)["']''',
+        rf'''["']{escaped_key}["']\s*:\s*(\d+)''',
+        rf'''\b{escaped_key}\s*=\s*(\d+)''',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, page_html, re.IGNORECASE)
+        if match:
+            return unquote(match.group(1))
+    return ""
+
+
 def get_scraper_headers():
     cookie = TERABOX.COOKIE.strip()
 
@@ -356,7 +372,88 @@ def get_file_info(share_url):
     download_link = file_data.get("dlink") or ""
 
     if not download_link:
-        raise ValueError("TeraBox response did not contain a download link")
+        # The share/list response commonly contains file metadata but no dlink.
+        # Request the actual download URL using the share/download endpoint.
+        metadata = info.get("data") if isinstance(info.get("data"), dict) else info
+        shareid = (
+            metadata.get("shareid")
+            or file_data.get("shareid")
+            or extract_page_value(normalized_html, "shareid")
+        )
+        uk = (
+            metadata.get("uk")
+            or file_data.get("uk")
+            or extract_page_value(normalized_html, "uk")
+        )
+        sign = (
+            metadata.get("sign")
+            or file_data.get("sign")
+            or extract_page_value(normalized_html, "sign")
+        )
+        timestamp = (
+            metadata.get("timestamp")
+            or file_data.get("timestamp")
+            or extract_page_value(normalized_html, "timestamp")
+        )
+        fs_id = file_data.get("fs_id") or file_data.get("fid")
+
+        missing_download_fields = [
+            name
+            for name, value in (
+                ("shareid", shareid),
+                ("uk", uk),
+                ("sign", sign),
+                ("timestamp", timestamp),
+                ("fs_id", fs_id),
+            )
+            if not value
+        ]
+        if missing_download_fields:
+            raise ValueError(
+                "TeraBox share page is missing download fields: "
+                + ", ".join(missing_download_fields)
+            )
+
+        download_response = session.post(
+            "https://www.terabox.app/share/download",
+            params={
+                "app_id": "250528",
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "0",
+                "jsToken": js_token,
+                "dp-logid": logid,
+                "shareid": str(shareid),
+                "sign": str(sign),
+                "timestamp": str(timestamp),
+            },
+            data={
+                "product": "share",
+                "nozip": "0",
+                "fid_list": f"[{fs_id}]",
+                "uk": str(uk),
+                "primaryid": str(shareid),
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": final_url,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        download_response.raise_for_status()
+        download_data = download_response.json()
+
+        if download_data.get("errno") not in (None, 0):
+            raise ValueError(
+                "TeraBox download API error: "
+                f"{download_data.get('errmsg') or download_data.get('errno')}"
+            )
+
+        download_link = download_data.get("dlink") or ""
+        if not download_link:
+            raise ValueError(
+                "TeraBox download API response did not contain a dlink"
+            )
 
     return {
         "name": file_data.get("server_filename") or "download",
