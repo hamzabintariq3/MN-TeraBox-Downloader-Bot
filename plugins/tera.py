@@ -4,6 +4,8 @@ import asyncio
 import logging
 import tempfile
 import shutil
+import time
+from html import escape
 import requests
 
 
@@ -501,6 +503,87 @@ def save_cached_upload(info, file_id, message_id=None):
 # QUEUE DATABASE FUNCTIONS
 # ============================================================
 
+def update_job_stage(job_id, stage):
+    queue_col.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "status": stage,
+            "stage": stage,
+            "progress_current": 0,
+            "progress_total": 0,
+            "progress_percent": None,
+            "phase_started_at": utcnow(),
+            "updated_at": utcnow(),
+        }},
+    )
+
+
+def update_job_progress(job_id, stage, current=0, total=0):
+    current = max(0, int(current or 0))
+    total = max(0, int(total or 0))
+    percent = round(current * 100 / total, 1) if total else None
+    queue_col.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "status": stage,
+            "stage": stage,
+            "progress_current": current,
+            "progress_total": total,
+            "progress_percent": percent,
+            "updated_at": utcnow(),
+        }},
+    )
+
+
+def format_eta(seconds):
+    if seconds is None or seconds < 0:
+        return "Unknown"
+    seconds = int(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def queue_progress_text(job):
+    status = job.get("status", "UNKNOWN")
+    current = int(job.get("progress_current") or 0)
+    total = int(job.get("progress_total") or 0)
+
+    if status in ("DOWNLOADING", "UPLOADING"):
+        if total:
+            percent = round(current * 100 / total, 1)
+            filled = min(10, int(percent // 10))
+            bar = "█" * filled + "░" * (10 - filled)
+            eta = "Unknown"
+            started = job.get("phase_started_at")
+            if started:
+                elapsed = max(1, (utcnow() - started).total_seconds())
+                speed = current / elapsed
+                if speed > 0:
+                    eta = format_eta((total - current) / speed)
+            return f"{bar} {percent}% ({get_size(current)} / {get_size(total)}) · ETA {eta}"
+        return f"{get_size(current)} transferred · total size unknown"
+
+    if status == "RESOLVING":
+        return "Resolving TeraBox file information"
+    if status == "RETRYING":
+        return f"Retry {job.get('retry_count', 0)}/{MAX_RETRIES}"
+    if status == "QUEUED":
+        return "Waiting"
+    if status == "COMPLETED":
+        return "100% · Complete"
+    if status == "FAILED":
+        return "Failed"
+    if status == "CANCELLED":
+        return "Cancelled"
+    return status.title()
+
+
+
 def create_job(
     url,
     user_id,
@@ -553,29 +636,26 @@ def create_job(
 
 def get_next_job():
     return queue_col.find_one_and_update(
-        {
-            "status": "QUEUED",
-        },
-        {
-            "$set": {
-                "status": "DOWNLOADING",
-                "started_at": utcnow(),
-                "worker": str(
-                    os.getpid()
-                ),
-                "error": None,
-            }
-        },
+        {"status": "QUEUED"},
+        {"$set": {
+            "status": "RESOLVING",
+            "stage": "RESOLVING",
+            "started_at": utcnow(),
+            "worker": str(os.getpid()),
+            "error": None,
+            "progress_current": 0,
+            "progress_total": 0,
+            "progress_percent": None,
+            "phase_started_at": utcnow(),
+        }},
         sort=[("created_at", ASCENDING)],
         return_document=ReturnDocument.AFTER,
     )
-
-
 def recover_jobs():
     result = queue_col.update_many(
         {
             "status": {
-                "$in": ["DOWNLOADING", "UPLOADING"]
+                "$in": ["RESOLVING", "DOWNLOADING", "UPLOADING"]
             }
         },
         {
@@ -607,18 +687,7 @@ def recover_jobs():
     )
 
 def mark_uploading(job_id):
-    queue_col.update_one(
-        {
-            "job_id": job_id,
-        },
-        {
-            "$set": {
-                "status": "UPLOADING",
-            }
-        },
-    )
-
-
+    update_job_stage(job_id, "UPLOADING")
 def mark_completed(
     job_id,
     filename,
@@ -707,23 +776,18 @@ def convert_retrying_to_queued():
 # DOWNLOAD
 # ============================================================
 
-def download_file(info, target_dir):
+def download_file(info, target_dir, job_id):
     download_url = info.get("download_link")
-
     if not download_url:
-        raise ValueError(
-            "No direct download URL available"
-        )
+        raise ValueError("No direct download URL available")
+
+    update_job_stage(job_id, "DOWNLOADING")
 
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64)"
-        ),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "*/*",
         "Connection": "keep-alive",
     }
-
     if TERABOX.COOKIE.strip():
         headers["Cookie"] = TERABOX.COOKIE.strip()
 
@@ -733,80 +797,47 @@ def download_file(info, target_dir):
         stream=True,
         timeout=REQUEST_TIMEOUT,
     )
-
     response.raise_for_status()
 
     original_name = filename_from_response(
         response,
         info.get("name") or "download",
     )
-
     info["name"] = original_name
 
-    # Never use original filename as actual temporary path.
-    # This prevents filename collisions and filesystem issues.
-    safe_name = clean_filename(
-        original_name
-    )
-
-    temp_path = os.path.join(
-        target_dir,
-        f"{uuid4().hex}_{safe_name}",
-    )
-
+    safe_name = clean_filename(original_name)
+    temp_path = os.path.join(target_dir, f"{uuid4().hex}_{safe_name}")
     downloaded = 0
+    total = int(response.headers.get("content-length", 0) or 0)
+    last_update = 0.0
 
-    total = int(
-        response.headers.get(
-            "content-length",
-            0,
-        )
-        or 0
-    )
-
-    with open(
-        temp_path,
-        "wb",
-    ) as output:
-
-        for chunk in response.iter_content(
-            chunk_size=1024 * 1024
-        ):
+    update_job_progress(job_id, "DOWNLOADING", 0, total)
+    with open(temp_path, "wb") as output:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
             if not chunk:
                 continue
-
             output.write(chunk)
             downloaded += len(chunk)
 
+            now = time.monotonic()
+            if now - last_update >= 3 or (total and downloaded >= total):
+                update_job_progress(
+                    job_id,
+                    "DOWNLOADING",
+                    downloaded,
+                    total,
+                )
+                last_update = now
+
     if total and downloaded != total:
-        raise IOError(
-            f"Incomplete download: "
-            f"{downloaded}/{total} bytes"
-        )
-
+        raise IOError(f"Incomplete download: {downloaded}/{total} bytes")
     if not os.path.exists(temp_path):
-        raise IOError(
-            "Downloaded file does not exist"
-        )
+        raise IOError("Downloaded file does not exist")
 
-    actual_size = os.path.getsize(
-        temp_path
-    )
-
-    info["size_bytes"] = (
-        actual_size
-        if actual_size
-        else info.get("size_bytes", 0)
-    )
-
-    info["size_str"] = get_size(
-        info["size_bytes"]
-    )
-
+    actual_size = os.path.getsize(temp_path)
+    info["size_bytes"] = actual_size or info.get("size_bytes", 0)
+    info["size_str"] = get_size(info["size_bytes"])
     return temp_path
-
-
-# ============================================================
 # CAPTION
 # ============================================================
 
@@ -844,6 +875,7 @@ async def process_job(client, job):
             get_download_info,
             url,
         )
+        info["_job_id"] = job_id
 
         filename = info.get(
             "name",
@@ -921,6 +953,7 @@ async def process_job(client, job):
             download_file,
             info,
             temp_dir,
+            job_id,
         )
 
         # ----------------------------------------------------
@@ -930,17 +963,29 @@ async def process_job(client, job):
         mark_uploading(job_id)
 
         if not CHANNEL.ID:
-            raise ValueError(
-                "CHANNEL_ID is not configured"
-            )
+            raise ValueError("CHANNEL_ID is not configured")
+
+        last_upload_update = [0.0]
+
+        async def upload_progress(current, total, *_):
+            now = time.monotonic()
+            if now - last_upload_update[0] >= 3 or current >= total:
+                last_upload_update[0] = now
+                await asyncio.to_thread(
+                    update_job_progress,
+                    job_id,
+                    "UPLOADING",
+                    current,
+                    total,
+                )
 
         sent = await client.send_document(
             chat_id=CHANNEL.ID,
             document=temp_path,
             caption=build_caption(info),
             file_name=filename,
+            progress=upload_progress,
         )
-
         if not sent:
             raise RuntimeError(
                 "Telegram did not return upload message"
@@ -1146,26 +1191,13 @@ async def handle_terabox(
     filters.private
     & filters.command("queue")
 )
-async def queue_command(
-    client: Client,
-    message: Message,
-):
+async def queue_command(client: Client, message: Message):
     rows = await asyncio.to_thread(
         lambda: list(
             queue_col.find(
-                {
-                    "user_id": message.from_user.id,
-                    "status": {
-                        "$in": [
-                            "QUEUED",
-                            "DOWNLOADING",
-                            "UPLOADING",
-                            "RETRYING",
-                        ],
-                    },
-                }
+                {"user_id": message.from_user.id}
             )
-            .sort("created_at", ASCENDING)
+            .sort("created_at", -1)
             .limit(20)
         )
     )
@@ -1174,19 +1206,29 @@ async def queue_command(
         await message.reply_text("📭 Your queue is empty.")
         return
 
-    lines = [
-        "📋 <b>Your Queue</b>",
-        "",
-    ]
+    lines = ["📋 <b>Latest 20 jobs</b>", ""]
 
     for index, job in enumerate(rows, start=1):
-        name = job.get("filename") or "Resolving..."
-        status = job.get("status", "UNKNOWN")
-        lines.append(f"{index}. <b>{name}</b> — {status}")
+        name = escape(job.get("filename") or "Resolving file information...")
+        status = escape(job.get("status", "UNKNOWN"))
+        lines.append(f"{index}. <b>{name}</b>")
+        lines.append(f"   Status: <b>{status}</b>")
+        lines.append(f"   Progress: {escape(queue_progress_text(job))}")
 
-    await message.reply_text("\n".join(lines))
+        retries = int(job.get("retry_count") or 0)
+        if retries:
+            lines.append(f"   Retry: {retries}/{MAX_RETRIES}")
 
-# ============================================================
+        error = job.get("error")
+        if error and status in ("FAILED", "RETRYING"):
+            lines.append(f"   Error: {escape(str(error)[:180])}")
+
+        lines.append("")
+
+    await message.reply_text(
+        "\n".join(lines),
+        disable_web_page_preview=True,
+    )
 # /STATUS
 # ============================================================
 
@@ -1194,44 +1236,20 @@ async def queue_command(
     filters.private
     & filters.command("status")
 )
-async def status_command(
-    client: Client,
-    message: Message,
-):
-
+async def status_command(client: Client, message: Message):
     pipeline = [
-        {
-            "$match": {
-                "user_id":
-                    message.from_user.id
-            }
-        },
-        {
-            "$group": {
-                "_id": "$status",
-                "count": {
-                    "$sum": 1
-                },
-            }
-        },
+        {"$match": {"user_id": message.from_user.id}},
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}},
     ]
-
     data = await asyncio.to_thread(
-        lambda: list(
-            queue_col.aggregate(
-                pipeline
-            )
-        )
+        lambda: list(queue_col.aggregate(pipeline))
     )
-
-    counts = {
-        row["_id"]: row["count"]
-        for row in data
-    }
+    counts = {row["_id"]: row["count"] for row in data}
 
     text = (
         "📊 <b>Transfer Status</b>\n\n"
         f"Queued: {counts.get('QUEUED', 0)}\n"
+        f"Resolving: {counts.get('RESOLVING', 0)}\n"
         f"Downloading: {counts.get('DOWNLOADING', 0)}\n"
         f"Uploading: {counts.get('UPLOADING', 0)}\n"
         f"Retrying: {counts.get('RETRYING', 0)}\n"
@@ -1239,11 +1257,7 @@ async def status_command(
         f"Failed: {counts.get('FAILED', 0)}\n"
         f"Cancelled: {counts.get('CANCELLED', 0)}"
     )
-
     await message.reply_text(text)
-
-
-# ============================================================
 # /CANCEL
 # ============================================================
 
