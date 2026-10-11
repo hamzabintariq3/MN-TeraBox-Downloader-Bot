@@ -6,14 +6,16 @@ import tempfile
 import shutil
 import requests
 
-from datetime import datetime
+
+from datetime import datetime, timedelta
+
 from uuid import uuid4
 from urllib.parse import urlencode, urlparse, parse_qs, quote_plus, unquote
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient, ASCENDING, ReturnDocument
 
 from config import CHANNEL, DATABASE, TERABOX, QUEUE
 
@@ -548,10 +550,8 @@ def get_next_job():
                 "error": None,
             }
         },
-        sort=[
-            ("created_at", ASCENDING)
-        ],
-        return_document=True,
+        sort=[("created_at", ASCENDING)],
+        return_document=ReturnDocument.AFTER,
     )
 
 
@@ -559,11 +559,7 @@ def recover_jobs():
     result = queue_col.update_many(
         {
             "status": {
-                "$in": [
-                    "DOWNLOADING",
-                    "UPLOADING",
-                    "RETRYING",
-                ]
+                "$in": ["DOWNLOADING", "UPLOADING"]
             }
         },
         {
@@ -575,11 +571,24 @@ def recover_jobs():
         },
     )
 
+    # Migrate older retry jobs that have no scheduled retry time.
+    queue_col.update_many(
+        {
+            "status": "RETRYING",
+            "next_retry_at": {"$exists": False},
+        },
+        {
+            "$set": {
+                "status": "QUEUED",
+                "worker": None,
+            }
+        },
+    )
+
     log.info(
         "Recovered %s interrupted jobs",
         result.modified_count,
     )
-
 
 def mark_uploading(job_id):
     queue_col.update_one(
@@ -618,63 +627,65 @@ def mark_completed(
     )
 
 
+
 def mark_retry(job_id, error):
-    job = queue_col.find_one(
-        {
-            "job_id": job_id,
-        }
-    )
+    job = queue_col.find_one({"job_id": job_id})
 
     if not job:
         return
 
-    retry_count = int(
-        job.get("retry_count", 0)
-    ) + 1
+    retry_count = int(job.get("retry_count", 0)) + 1
 
-    if retry_count >= MAX_RETRIES:
+    if retry_count > MAX_RETRIES:
         queue_col.update_one(
-            {
-                "job_id": job_id,
-            },
+            {"job_id": job_id},
             {
                 "$set": {
                     "status": "FAILED",
                     "error": str(error),
                     "retry_count": retry_count,
                     "worker": None,
+                    "next_retry_at": None,
                 }
             },
         )
-
     else:
         queue_col.update_one(
-            {
-                "job_id": job_id,
-            },
+            {"job_id": job_id},
             {
                 "$set": {
                     "status": "RETRYING",
                     "error": str(error),
                     "retry_count": retry_count,
                     "worker": None,
+                    "next_retry_at": utcnow() + timedelta(
+                        seconds=RETRY_DELAY
+                    ),
                 }
             },
         )
 
-
 def convert_retrying_to_queued():
+    now = utcnow()
+
     queue_col.update_many(
         {
             "status": "RETRYING",
+            "$or": [
+                {"next_retry_at": {"$lte": now}},
+                {"next_retry_at": {"$exists": False}},
+                {"next_retry_at": None},
+            ],
         },
         {
             "$set": {
                 "status": "QUEUED",
-            }
+            },
+            "$unset": {
+                "next_retry_at": "",
+            },
         },
     )
-
 
 # ============================================================
 # DOWNLOAD
@@ -1134,11 +1145,12 @@ async def queue_command(
                     "status": {
                         "$in": [
                             "QUEUED",
-                            "DOWNLOADING",
-                            "UPLOADING",
-                            "RETRYING",
-                        ],
-                    },
+        "DOWNLOADING",
+        "UPLOADING",
+        "RETRYING",
+    ],
+},
+
                 }
             ).sort(
                 "created_at",
@@ -1359,14 +1371,19 @@ async def retry_command(
                     message.from_user.id,
                 "status": "FAILED",
             },
-            {
-                "$set": {
-                    "status": "QUEUED",
-                    "retry_count": 0,
-                    "error": None,
-                    "worker": None,
-                }
-            },
+
+{
+    "$set": {
+        "status": "QUEUED",
+        "retry_count": 0,
+        "error": None,
+        "worker": None,
+    },
+    "$unset": {
+        "next_retry_at": "",
+    },
+}
+
         )
     )
 
@@ -1384,7 +1401,7 @@ async def stop_queue_workers():
     if not _workers:
         return
 
-    logger.info(
+    log.info(
         "Stopping %s TeraBox queue worker(s)...",
         len(_workers),
     )
@@ -1399,12 +1416,12 @@ async def stop_queue_workers():
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.exception(
+            log.exception(
                 "Error while stopping queue worker."
             )
 
     _workers.clear()
 
-    logger.info(
+    log.info(
         "All TeraBox queue workers stopped."
     )
